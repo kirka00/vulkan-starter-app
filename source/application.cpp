@@ -5,6 +5,8 @@
 #include <iostream>
 #include <vector>
 
+#include <imgui.h>
+
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE // Глубина в клип-пространстве Vulkan — [0, 1]
 #include <glm/glm.hpp>
@@ -14,6 +16,9 @@
 namespace application {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Структуры, общие с шейдерами
 
 struct Vertex {
 	glm::vec3 position;
@@ -27,9 +32,45 @@ struct alignas(16) ObjectUniforms {
 	glm::vec4 color;
 };
 
+// ---------------------------------------------------------------------------
+// Описание сцены
+
+struct Transform {
+	glm::vec3 position = glm::vec3(0.0f);
+	glm::vec3 rotation = glm::vec3(0.0f); // Углы Эйлера, градусы
+	glm::vec3 scale = glm::vec3(1.0f);
+};
+
+struct Animation {
+	bool enabled = true;
+	bool playing = true;
+	float time = 0.0f;   // Собственное время анимации, секунды
+	float speed = 1.0f;  // Множитель скорости
+	float radius = 2.0f;
+	float height = 1.0f;
+	float loops = 3.0f;
+	float spin = 90.0f;  // Скорость собственного вращения, градусов в секунду
+};
+
+struct Camera {
+	bool perspective = true;
+	float fov = 60.0f;          // Градусы, только для перспективы
+	float ortho_height = 10.0f; // Видимая высота в мировых единицах, только для ортографии
+
+	// Точка наблюдения фиксированная: подвижная камера не входит в эту работу
+	static constexpr float near_plane = 0.1f;
+	static constexpr float far_plane = 100.0f;
+	static constexpr float distance = 9.0f;
+	static constexpr float yaw = 30.0f;   // Градусы
+	static constexpr float pitch = 20.0f; // Градусы
+};
+
 constexpr uint32_t cylinder_segments = 50;
 constexpr float cylinder_radius = 1.0f;
 constexpr float cylinder_height = 2.0f;
+
+// ---------------------------------------------------------------------------
+// Состояние
 
 graphics::Mesh cylinder_mesh;
 
@@ -40,6 +81,16 @@ graphics::Buffer uniform_buffer;
 
 VkPipelineLayout pipeline_layout;
 VkPipeline pipeline;
+
+Transform transform;
+Animation animation;
+glm::vec4 color = glm::vec4(1.0f, 0.85f, 0.6f, 1.0f);
+Camera camera;
+
+double last_time = 0.0;
+
+// ---------------------------------------------------------------------------
+// Геометрия
 
 glm::vec3 proceduralColor(const glm::vec3& p) {
 	return glm::vec3(
@@ -83,6 +134,61 @@ void buildCylinder(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices
 		indices.insert(indices.end(), { bottom_center, bottom_i, bottom_j });
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Математика
+
+glm::mat4 modelMatrix(const Transform& t, const Animation& a) {
+	glm::vec3 position = t.position;
+	glm::mat4 rotation = glm::mat4(1.0f);
+
+	if (a.enabled) {
+		const float angle = a.time;
+		position += glm::vec3(a.radius * std::cos(angle),
+		                      a.height * std::sin(a.loops * angle),
+		                      a.radius * std::sin(angle));
+
+		const float spin = glm::radians(a.spin) * a.time;
+		rotation = glm::rotate(glm::mat4(1.0f), spin, glm::vec3(0.0f, 1.0f, 0.0f)) *
+		           glm::rotate(glm::mat4(1.0f), spin * 0.5f, glm::vec3(1.0f, 0.0f, 0.0f));
+	}
+
+	rotation = rotation *
+	           glm::rotate(glm::mat4(1.0f), glm::radians(t.rotation.z), glm::vec3(0.0f, 0.0f, 1.0f)) *
+	           glm::rotate(glm::mat4(1.0f), glm::radians(t.rotation.y), glm::vec3(0.0f, 1.0f, 0.0f)) *
+	           glm::rotate(glm::mat4(1.0f), glm::radians(t.rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+
+	return glm::translate(glm::mat4(1.0f), position) * rotation *
+	       glm::scale(glm::mat4(1.0f), t.scale);
+}
+
+glm::mat4 viewMatrix(const Camera& c) {
+	const float yaw = glm::radians(c.yaw);
+	const float pitch = glm::radians(c.pitch);
+	const glm::vec3 eye = c.distance * glm::vec3(
+		std::cos(pitch) * std::sin(yaw),
+		std::sin(pitch),
+		std::cos(pitch) * std::cos(yaw)
+	);
+	return glm::lookAt(eye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+}
+
+glm::mat4 projectionMatrix(const Camera& c, float aspect) {
+	glm::mat4 projection;
+	if (c.perspective) {
+		projection = glm::perspective(glm::radians(c.fov), aspect, c.near_plane, c.far_plane);
+	} else {
+		const float half_h = c.ortho_height * 0.5f;
+		const float half_w = half_h * aspect;
+		projection = glm::ortho(-half_w, half_w, -half_h, half_h, c.near_plane, c.far_plane);
+	}
+	// GLM рассчитан на OpenGL (Y в клип-пространстве вверх), в Vulkan — вниз
+	projection[1][1] *= -1.0f;
+	return projection;
+}
+
+// ---------------------------------------------------------------------------
+// Объекты Vulkan
 
 bool createDescriptors() {
 	auto& context = graphics::internal::context;
@@ -208,6 +314,65 @@ bool createPipeline() {
 	return pipeline != VK_NULL_HANDLE;
 }
 
+// ---------------------------------------------------------------------------
+// Интерфейс
+
+void drawUI() {
+	ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_FirstUseEver);
+	ImGui::Begin("Lab 1 - Cylinder");
+
+	ImGui::Text("%.1f FPS  |  %u vertices, %u triangles",
+	            double(ImGui::GetIO().Framerate), cylinder_mesh.vertex_count,
+	            cylinder_mesh.index_count / 3);
+
+	if (ImGui::CollapsingHeader("Projection", ImGuiTreeNodeFlags_DefaultOpen)) {
+		int mode = camera.perspective ? 0 : 1;
+		ImGui::RadioButton("Perspective", &mode, 0);
+		ImGui::SameLine();
+		ImGui::RadioButton("Orthographic", &mode, 1);
+		camera.perspective = (mode == 0);
+
+		if (camera.perspective) {
+			ImGui::SliderFloat("FOV (deg)", &camera.fov, 10.0f, 150.0f);
+		} else {
+			ImGui::SliderFloat("View height", &camera.ortho_height, 1.0f, 30.0f);
+		}
+	}
+
+	if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::DragFloat3("Position", &transform.position.x, 0.02f);
+		ImGui::DragFloat3("Rotation (deg)", &transform.rotation.x, 1.0f, -360.0f, 360.0f);
+		ImGui::DragFloat3("Scale", &transform.scale.x, 0.02f, 0.05f, 10.0f);
+	}
+
+	if (ImGui::CollapsingHeader("Animation", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Checkbox("Enable trajectory", &animation.enabled);
+		ImGui::BeginDisabled(!animation.enabled);
+		if (ImGui::Button(animation.playing ? "Pause" : "Play")) {
+			animation.playing = !animation.playing;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Restart")) {
+			animation.time = 0.0f;
+		}
+		ImGui::SameLine();
+		ImGui::Text("t = %.2f s", animation.time);
+		ImGui::SliderFloat("Speed", &animation.speed, 0.0f, 5.0f);
+		ImGui::SliderFloat("Radius", &animation.radius, 0.0f, 6.0f);
+		ImGui::SliderFloat("Height", &animation.height, 0.0f, 4.0f);
+		ImGui::SliderFloat("Loops per revolution", &animation.loops, 0.0f, 8.0f);
+		ImGui::SliderFloat("Spin (deg/s)", &animation.spin, -360.0f, 360.0f);
+		ImGui::EndDisabled();
+	}
+
+	if (ImGui::CollapsingHeader("Color", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::ColorEdit3("Tint", &color.x);
+	}
+
+	ImGui::End();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -221,7 +386,13 @@ bool initialize() {
 		return false;
 	}
 
-	return createDescriptors() && createPipeline();
+	if (!createDescriptors() || !createPipeline()) {
+		return false;
+	}
+
+	transform.rotation = glm::vec3(20.0f, 0.0f, 15.0f);
+
+	return true;
 }
 
 void shutdown() {
@@ -239,7 +410,15 @@ void shutdown() {
 	graphics::destroyMesh(cylinder_mesh);
 }
 
-void update([[maybe_unused]] double time) {
+void update(double time) {
+	const float dt = last_time > 0.0 ? float(time - last_time) : 0.0f;
+	last_time = time;
+
+	if (animation.enabled && animation.playing) {
+		animation.time += dt * animation.speed;
+	}
+
+	drawUI();
 }
 
 void render(const graphics::internal::FrameData& fd) {
@@ -250,18 +429,14 @@ void render(const graphics::internal::FrameData& fd) {
 	auto& context = graphics::internal::context;
 	const VkExtent2D extent = context.swapchain_extent;
 
-	// Пока точка наблюдения фиксированная, матрицы уедут в интерфейс позже
+	// Предыдущий кадр уже дорисован (prepare дождался fence),
+	// поэтому uniform-буфер можно спокойно перезаписать
 	const float aspect = float(extent.width) / float(extent.height);
-	glm::mat4 projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 100.0f);
-	// GLM рассчитан на OpenGL (Y в клип-пространстве вверх), в Vulkan — вниз
-	projection[1][1] *= -1.0f;
-
 	const ObjectUniforms uniforms = {
-		.model = glm::mat4(1.0f),
-		.view = glm::lookAt(glm::vec3(4.0f, 3.0f, 7.5f), glm::vec3(0.0f),
-		                    glm::vec3(0.0f, 1.0f, 0.0f)),
-		.projection = projection,
-		.color = glm::vec4(1.0f),
+		.model = modelMatrix(transform, animation),
+		.view = viewMatrix(camera),
+		.projection = projectionMatrix(camera, aspect),
+		.color = color,
 	};
 	graphics::uploadBuffer(uniform_buffer, &uniforms, sizeof(uniforms));
 
@@ -314,6 +489,7 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdDrawIndexed(cmd, cylinder_mesh.index_count, 1, 0, 0, 0);
 
 	vkCmdEndRenderPass(cmd);
-	vkEndCommandBuffer(cmd);}
+	vkEndCommandBuffer(cmd);
+}
 
 } // namespace application
