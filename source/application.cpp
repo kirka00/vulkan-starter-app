@@ -18,43 +18,40 @@ namespace application {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Структуры, общие с шейдерами
 
 struct Vertex {
 	glm::vec3 position;
 	glm::vec3 normal;
 };
 
-// set 0: данные сцены, привязываются один раз за кадр
 struct alignas(16) SceneUniforms {
 	glm::mat4 view_projection;
+	glm::vec4 camera_position;
+	glm::vec4 ambient;        // rgb = цвет, a = интенсивность
+	glm::vec4 sun_direction;  // xyz = направление, куда летит свет
+	glm::vec4 sun_color;      // rgb = цвет, a = интенсивность
+	glm::uvec4 light_counts;  // x = точечные источники, y = прожекторные
 };
 
-// set 1: данные объекта, перепривязываются перед каждой отрисовкой
 struct alignas(16) ModelUniforms {
 	glm::mat4 model;
+	glm::mat4 normal_matrix;
+	glm::vec4 albedo;
+	glm::vec4 specular; // rgb = цвет блика, a = коэффициент блеска
+};
+
+struct alignas(16) PointLightGPU {
+	glm::vec4 position;
+	glm::vec4 color;
+};
+
+struct alignas(16) SpotLightGPU {
+	glm::vec4 position;  // w = косинус внутреннего угла
+	glm::vec4 direction; // w = косинус внешнего угла
 	glm::vec4 color;
 };
 
 // ---------------------------------------------------------------------------
-// Описание сцены
-
-struct Transform {
-	glm::vec3 position = glm::vec3(0.0f);
-	glm::vec3 rotation = glm::vec3(0.0f); // Углы Эйлера, градусы
-	glm::vec3 scale = glm::vec3(1.0f);
-};
-
-struct Animation {
-	bool enabled = true;
-	bool playing = true;
-	float time = 0.0f;   // Собственное время анимации, секунды
-	float speed = 1.0f;  // Множитель скорости
-	float radius = 2.0f;
-	float height = 1.0f;
-	float loops = 3.0f;
-	float spin = 90.0f;  // Скорость собственного вращения, градусов в секунду
-};
 
 struct Camera {
 	glm::vec3 position = glm::vec3(0.0f, 1.2f, 7.0f);
@@ -67,14 +64,54 @@ struct Camera {
 	static constexpr float far_plane = 100.0f;
 };
 
+struct Material {
+	glm::vec3 albedo = glm::vec3(0.85f, 0.50f, 0.25f);
+	glm::vec3 specular = glm::vec3(1.0f);
+	float shininess = 48.0f;
+};
+
+struct DirectionalLight {
+	glm::vec3 direction = glm::vec3(-0.55f, -0.75f, -0.45f);
+	glm::vec3 color = glm::vec3(1.0f, 0.96f, 0.88f);
+	float intensity = 0.5f;
+};
+
+struct PointLight {
+	glm::vec3 position = glm::vec3(2.5f, 0.6f, 2.0f);
+	glm::vec3 color = glm::vec3(1.0f, 0.35f, 0.15f);
+	float intensity = 14.0f;
+};
+
+struct SpotLight {
+	glm::vec3 position = glm::vec3(0.0f, 4.5f, 1.0f);
+	glm::vec3 direction = glm::vec3(0.0f, -1.0f, -0.15f);
+	glm::vec3 color = glm::vec3(0.45f, 0.75f, 1.0f);
+	float intensity = 55.0f;
+	float inner_angle = 14.0f; // Градусы, половина угла яркой середины
+	float outer_angle = 24.0f; // Градусы, половина угла, где свет гаснет
+};
+
+struct Model {
+	graphics::Mesh mesh;
+	graphics::Buffer uniform_buffer;
+	VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+};
+
 constexpr uint32_t cylinder_segments = 50;
 constexpr float cylinder_radius = 1.0f;
 constexpr float cylinder_height = 2.0f;
 
+constexpr float floor_half_size = 7.0f;
+constexpr float floor_level = -1.5f;
+constexpr float cylinder_level = floor_level + cylinder_height * 0.5f;
+
+constexpr uint32_t light_capacity = 16;
+
 // ---------------------------------------------------------------------------
 // Состояние
 
-graphics::Mesh cylinder_mesh;
+Model cylinder;
+Model floor_plane;
 
 VkDescriptorSetLayout scene_set_layout;
 VkDescriptorSetLayout model_set_layout;
@@ -82,17 +119,21 @@ VkDescriptorPool descriptor_pool;
 
 VkDescriptorSet scene_descriptor_set;
 graphics::Buffer scene_uniform_buffer;
-
-VkDescriptorSet model_descriptor_set;
-graphics::Buffer model_uniform_buffer;
+graphics::Buffer point_light_buffer;
+graphics::Buffer spot_light_buffer;
 
 VkPipelineLayout pipeline_layout;
 VkPipeline pipeline;
 
-Transform transform;
-Animation animation;
-glm::vec4 color = glm::vec4(1.0f, 0.85f, 0.6f, 1.0f);
 Camera camera;
+Material cylinder_material;
+const Material floor_material = { glm::vec3(0.22f, 0.24f, 0.28f), glm::vec3(0.35f), 16.0f };
+DirectionalLight sun;
+glm::vec3 ambient_color = glm::vec3(1.0f);
+float ambient_intensity = 0.05f;
+
+std::vector<PointLight> point_lights = { PointLight{} };
+std::vector<SpotLight> spot_lights = { SpotLight{} };
 
 double last_time = 0.0;
 
@@ -144,32 +185,19 @@ void buildCylinder(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices
 	}
 }
 
+void buildFloor(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices, float half_size) {
+	const glm::vec3 normal(0.0f, 1.0f, 0.0f);
+	vertices = {
+		{ glm::vec3(-half_size, 0.0f, -half_size), normal },
+		{ glm::vec3(-half_size, 0.0f,  half_size), normal },
+		{ glm::vec3( half_size, 0.0f,  half_size), normal },
+		{ glm::vec3( half_size, 0.0f, -half_size), normal },
+	};
+	indices = { 0, 1, 2, 0, 2, 3 };
+}
+
 // ---------------------------------------------------------------------------
 // Математика
-
-glm::mat4 modelMatrix(const Transform& t, const Animation& a) {
-	glm::vec3 position = t.position;
-	glm::mat4 rotation = glm::mat4(1.0f);
-
-	if (a.enabled) {
-		const float angle = a.time;
-		position += glm::vec3(a.radius * std::cos(angle),
-		                      a.height * std::sin(a.loops * angle),
-		                      a.radius * std::sin(angle));
-
-		const float spin = glm::radians(a.spin) * a.time;
-		rotation = glm::rotate(glm::mat4(1.0f), spin, glm::vec3(0.0f, 1.0f, 0.0f)) *
-		           glm::rotate(glm::mat4(1.0f), spin * 0.5f, glm::vec3(1.0f, 0.0f, 0.0f));
-	}
-
-	rotation = rotation *
-	           glm::rotate(glm::mat4(1.0f), glm::radians(t.rotation.z), glm::vec3(0.0f, 0.0f, 1.0f)) *
-	           glm::rotate(glm::mat4(1.0f), glm::radians(t.rotation.y), glm::vec3(0.0f, 1.0f, 0.0f)) *
-	           glm::rotate(glm::mat4(1.0f), glm::radians(t.rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
-
-	return glm::translate(glm::mat4(1.0f), position) * rotation *
-	       glm::scale(glm::mat4(1.0f), t.scale);
-}
 
 glm::vec3 cameraForward(const Camera& c) {
 	const float yaw = glm::radians(c.yaw);
@@ -187,42 +215,14 @@ glm::mat4 viewMatrix(const Camera& c) {
 
 glm::mat4 projectionMatrix(const Camera& c, float aspect) {
 	glm::mat4 projection = glm::perspective(glm::radians(c.fov), aspect,
-	                                        c.near_plane, c.far_plane);
+	                                        Camera::near_plane, Camera::far_plane);
 	// GLM рассчитан на OpenGL (Y в клип-пространстве вверх), в Vulkan — вниз
 	projection[1][1] *= -1.0f;
 	return projection;
 }
 
-// ---------------------------------------------------------------------------
-// Управление камерой
-
-void updateCamera(float dt) {
-	ImGuiIO& io = ImGui::GetIO();
-
-	if (!io.WantCaptureMouse && ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
-		constexpr float sensitivity = 0.15f;
-		camera.yaw += io.MouseDelta.x * sensitivity;
-		camera.pitch = glm::clamp(camera.pitch - io.MouseDelta.y * sensitivity, -89.0f, 89.0f);
-	}
-
-	if (io.WantCaptureKeyboard) {
-		return;
-	}
-
-	const glm::vec3 forward = cameraForward(camera);
-	const glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
-
-	glm::vec3 motion(0.0f);
-	if (ImGui::IsKeyDown(ImGuiKey_W)) { motion += forward; }
-	if (ImGui::IsKeyDown(ImGuiKey_S)) { motion -= forward; }
-	if (ImGui::IsKeyDown(ImGuiKey_D)) { motion += right; }
-	if (ImGui::IsKeyDown(ImGuiKey_A)) { motion -= right; }
-	if (ImGui::IsKeyDown(ImGuiKey_E)) { motion += glm::vec3(0.0f, 1.0f, 0.0f); }
-	if (ImGui::IsKeyDown(ImGuiKey_Q)) { motion -= glm::vec3(0.0f, 1.0f, 0.0f); }
-
-	if (glm::dot(motion, motion) > 0.0f) {
-		camera.position += glm::normalize(motion) * Camera::move_speed * dt;
-	}
+glm::mat4 normalMatrix(const glm::mat4& model) {
+	return glm::mat4(glm::transpose(glm::inverse(glm::mat3(model))));
 }
 
 // ---------------------------------------------------------------------------
@@ -231,29 +231,82 @@ void updateCamera(float dt) {
 bool createDescriptorLayouts() {
 	auto& context = graphics::internal::context;
 
-	// Пока в обоих наборах по одному uniform-буферу
-	const VkDescriptorSetLayoutBinding binding = {
+	// set 0: сцена — uniform-буфер и два storage-буфера с источниками
+	const VkDescriptorSetLayoutBinding scene_bindings[] = {
+		{
+			.binding = 0,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 2,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+	};
+
+	const VkDescriptorSetLayoutCreateInfo scene_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = sizeof(scene_bindings) / sizeof(scene_bindings[0]),
+		.pBindings = scene_bindings,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &scene_layout, nullptr,
+	                                &scene_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create the scene descriptor set layout\n";
+		return false;
+	}
+
+	// set 1: модель — матрица и материал одного объекта
+	const VkDescriptorSetLayoutBinding model_binding = {
 		.binding = 0,
 		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 		.descriptorCount = 1,
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 	};
 
-	const VkDescriptorSetLayoutCreateInfo layout = {
+	const VkDescriptorSetLayoutCreateInfo model_layout = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
 		.bindingCount = 1,
-		.pBindings = &binding,
+		.pBindings = &model_binding,
 	};
 
-	if (vkCreateDescriptorSetLayout(context.device, &layout, nullptr,
-	                                &scene_set_layout) != VK_SUCCESS ||
-	    vkCreateDescriptorSetLayout(context.device, &layout, nullptr,
+	if (vkCreateDescriptorSetLayout(context.device, &model_layout, nullptr,
 	                                &model_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create a descriptor set layout\n";
+		std::cerr << "Failed to create the model descriptor set layout\n";
 		return false;
 	}
 
 	return true;
+}
+
+void writeBufferDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                           const graphics::Buffer& buffer) {
+	const VkDescriptorBufferInfo buffer_info = {
+		.buffer = buffer.buffer,
+		.offset = 0,
+		.range = buffer.size,
+	};
+
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = set,
+		.dstBinding = binding,
+		.dstArrayElement = 0,
+		.descriptorCount = 1,
+		.descriptorType = type,
+		.pBufferInfo = &buffer_info,
+	};
+
+	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
 }
 
 bool allocateSet(VkDescriptorSetLayout layout, VkDescriptorSet& out) {
@@ -266,40 +319,23 @@ bool allocateSet(VkDescriptorSetLayout layout, VkDescriptorSet& out) {
 	return vkAllocateDescriptorSets(graphics::internal::context.device, &allocate, &out) == VK_SUCCESS;
 }
 
-void writeBufferDescriptor(VkDescriptorSet set, const graphics::Buffer& buffer) {
-	const VkDescriptorBufferInfo buffer_info = {
-		.buffer = buffer.buffer,
-		.offset = 0,
-		.range = buffer.size,
-	};
-
-	const VkWriteDescriptorSet write = {
-		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.dstSet = set,
-		.dstBinding = 0,
-		.dstArrayElement = 0,
-		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.pBufferInfo = &buffer_info,
-	};
-
-	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
-}
-
 bool createDescriptors() {
 	auto& context = graphics::internal::context;
 
-	// По одному uniform-буферу на набор, наборов два
-	const VkDescriptorPoolSize pool_size = {
-		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 2,
+	constexpr uint32_t model_count = 2;
+
+	// maxSets и descriptorCount должны покрывать всё, что выделяется
+	// из этого пула: набор сцены плюс по набору на модель
+	const VkDescriptorPoolSize pool_sizes[] = {
+		{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 + model_count },
+		{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
 	};
 
 	const VkDescriptorPoolCreateInfo pool = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 2,
-		.poolSizeCount = 1,
-		.pPoolSizes = &pool_size,
+		.maxSets = 1 + model_count,
+		.poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]),
+		.pPoolSizes = pool_sizes,
 	};
 
 	if (vkCreateDescriptorPool(context.device, &pool, nullptr, &descriptor_pool) != VK_SUCCESS) {
@@ -309,19 +345,37 @@ bool createDescriptors() {
 
 	if (!graphics::createBuffer(scene_uniform_buffer, sizeof(SceneUniforms),
 	                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
-	    !graphics::createBuffer(model_uniform_buffer, sizeof(ModelUniforms),
-	                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+	    !graphics::createBuffer(point_light_buffer, sizeof(PointLightGPU) * light_capacity,
+	                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+	    !graphics::createBuffer(spot_light_buffer, sizeof(SpotLightGPU) * light_capacity,
+	                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
 		return false;
 	}
 
-	if (!allocateSet(scene_set_layout, scene_descriptor_set) ||
-	    !allocateSet(model_set_layout, model_descriptor_set)) {
-		std::cerr << "Failed to allocate a descriptor set\n";
+	if (!allocateSet(scene_set_layout, scene_descriptor_set)) {
+		std::cerr << "Failed to allocate the scene descriptor set\n";
 		return false;
 	}
 
-	writeBufferDescriptor(scene_descriptor_set, scene_uniform_buffer);
-	writeBufferDescriptor(model_descriptor_set, model_uniform_buffer);
+	writeBufferDescriptor(scene_descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+	                      scene_uniform_buffer);
+	writeBufferDescriptor(scene_descriptor_set, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	                      point_light_buffer);
+	writeBufferDescriptor(scene_descriptor_set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	                      spot_light_buffer);
+
+	for (Model* model : { &cylinder, &floor_plane }) {
+		if (!graphics::createBuffer(model->uniform_buffer, sizeof(ModelUniforms),
+		                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+			return false;
+		}
+		if (!allocateSet(model_set_layout, model->descriptor_set)) {
+			std::cerr << "Failed to allocate a model descriptor set\n";
+			return false;
+		}
+		writeBufferDescriptor(model->descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		                      model->uniform_buffer);
+	}
 
 	return true;
 }
@@ -329,7 +383,7 @@ bool createDescriptors() {
 bool createPipeline() {
 	auto& context = graphics::internal::context;
 
-	// Layout перечисляет оба набора в том порядке, в котором их ждёт шейдер
+	// Layout конвейера перечисляет оба набора в порядке, который ждёт шейдер
 	const VkDescriptorSetLayout set_layouts[] = { scene_set_layout, model_set_layout };
 
 	const VkPipelineLayoutCreateInfo layout = {
@@ -339,7 +393,7 @@ bool createPipeline() {
 	};
 
 	if (vkCreatePipelineLayout(context.device, &layout, nullptr, &pipeline_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create pipeline layout\n";
+		std::cerr << "Failed to create the pipeline layout\n";
 		return false;
 	}
 
@@ -376,55 +430,196 @@ bool createPipeline() {
 }
 
 // ---------------------------------------------------------------------------
+// Управление камерой
+
+void updateCamera(float dt) {
+	ImGuiIO& io = ImGui::GetIO();
+
+	if (!io.WantCaptureMouse && ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+		constexpr float sensitivity = 0.15f;
+		camera.yaw += io.MouseDelta.x * sensitivity;
+		camera.pitch = glm::clamp(camera.pitch - io.MouseDelta.y * sensitivity, -89.0f, 89.0f);
+	}
+
+	if (io.WantCaptureKeyboard) {
+		return;
+	}
+
+	const glm::vec3 forward = cameraForward(camera);
+	const glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
+
+	glm::vec3 motion(0.0f);
+	if (ImGui::IsKeyDown(ImGuiKey_W)) { motion += forward; }
+	if (ImGui::IsKeyDown(ImGuiKey_S)) { motion -= forward; }
+	if (ImGui::IsKeyDown(ImGuiKey_D)) { motion += right; }
+	if (ImGui::IsKeyDown(ImGuiKey_A)) { motion -= right; }
+	if (ImGui::IsKeyDown(ImGuiKey_E)) { motion += glm::vec3(0.0f, 1.0f, 0.0f); }
+	if (ImGui::IsKeyDown(ImGuiKey_Q)) { motion -= glm::vec3(0.0f, 1.0f, 0.0f); }
+
+	if (glm::dot(motion, motion) > 0.0f) {
+		camera.position += glm::normalize(motion) * camera.move_speed * dt;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Интерфейс
 
 void drawUI() {
 	ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_FirstUseEver);
-	ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_FirstUseEver);
-	ImGui::Begin("Lab 1 - Cylinder");
+	ImGui::SetNextWindowSize(ImVec2(400.0f, 610.0f), ImGuiCond_FirstUseEver);
+	ImGui::Begin("Lab 2 - Camera and lighting");
 
-	ImGui::Text("%.1f FPS  |  %u vertices, %u triangles",
-	            double(ImGui::GetIO().Framerate), cylinder_mesh.vertex_count,
-	            cylinder_mesh.index_count / 3);
+	ImGui::Text("%.1f FPS  |  %u point, %u spot lights",
+	            double(ImGui::GetIO().Framerate),
+	            uint32_t(point_lights.size()), uint32_t(spot_lights.size()));
 
 	if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::DragFloat3("Position", &camera.position.x, 0.05f);
-		ImGui::SliderFloat("Yaw (deg)", &camera.yaw, -180.0f, 180.0f);
-		ImGui::SliderFloat("Pitch (deg)", &camera.pitch, -89.0f, 89.0f);
-		ImGui::SliderFloat("FOV (deg)", &camera.fov, 20.0f, 120.0f);
+		ImGui::SliderFloat("Yaw", &camera.yaw, -180.0f, 180.0f);
+		ImGui::SliderFloat("Pitch", &camera.pitch, -89.0f, 89.0f);
+		ImGui::SliderFloat("FOV", &camera.fov, 20.0f, 120.0f);
 	}
 
-	if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::DragFloat3("Position", &transform.position.x, 0.02f);
-		ImGui::DragFloat3("Rotation (deg)", &transform.rotation.x, 1.0f, -360.0f, 360.0f);
-		ImGui::DragFloat3("Scale", &transform.scale.x, 0.02f, 0.05f, 10.0f);
+	if (ImGui::CollapsingHeader("Ambient and sun", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::ColorEdit3("Ambient color", &ambient_color.x);
+		ImGui::SliderFloat("Ambient intensity", &ambient_intensity, 0.0f, 1.0f);
+		ImGui::Spacing();
+		ImGui::DragFloat3("Sun direction", &sun.direction.x, 0.02f);
+		ImGui::ColorEdit3("Sun color", &sun.color.x);
+		ImGui::SliderFloat("Sun intensity", &sun.intensity, 0.0f, 3.0f);
 	}
 
-	if (ImGui::CollapsingHeader("Animation", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::Checkbox("Enable trajectory", &animation.enabled);
-		ImGui::BeginDisabled(!animation.enabled);
-		if (ImGui::Button(animation.playing ? "Pause" : "Play")) {
-			animation.playing = !animation.playing;
+	if (ImGui::CollapsingHeader("Material", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::ColorEdit3("Albedo", &cylinder_material.albedo.x);
+		ImGui::ColorEdit3("Specular", &cylinder_material.specular.x);
+		ImGui::SliderFloat("Shininess", &cylinder_material.shininess, 1.0f, 256.0f);
+	}
+
+	if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::BeginDisabled(point_lights.size() >= light_capacity);
+		if (ImGui::Button("Add point light")) {
+			point_lights.push_back(PointLight{});
 		}
-		ImGui::SameLine();
-		if (ImGui::Button("Restart")) {
-			animation.time = 0.0f;
-		}
-		ImGui::SameLine();
-		ImGui::Text("t = %.2f s", animation.time);
-		ImGui::SliderFloat("Speed", &animation.speed, 0.0f, 5.0f);
-		ImGui::SliderFloat("Radius", &animation.radius, 0.0f, 6.0f);
-		ImGui::SliderFloat("Height", &animation.height, 0.0f, 4.0f);
-		ImGui::SliderFloat("Loops per revolution", &animation.loops, 0.0f, 8.0f);
-		ImGui::SliderFloat("Spin (deg/s)", &animation.spin, -360.0f, 360.0f);
 		ImGui::EndDisabled();
+
+		for (size_t i = 0; i < point_lights.size();) {
+			ImGui::PushID(int(i));
+			bool remove = false;
+			if (ImGui::TreeNodeEx("light", ImGuiTreeNodeFlags_DefaultOpen, "Point light %zu", i)) {
+				ImGui::DragFloat3("Position", &point_lights[i].position.x, 0.05f);
+				ImGui::ColorEdit3("Color", &point_lights[i].color.x);
+				ImGui::SliderFloat("Intensity", &point_lights[i].intensity, 0.0f, 80.0f);
+				remove = ImGui::Button("Remove");
+				ImGui::TreePop();
+			}
+			ImGui::PopID();
+
+			if (remove) {
+				point_lights.erase(point_lights.begin() + long(i));
+			} else {
+				++i;
+			}
+		}
 	}
 
-	if (ImGui::CollapsingHeader("Color", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::ColorEdit3("Tint", &color.x);
+	if (ImGui::CollapsingHeader("Spot lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::BeginDisabled(spot_lights.size() >= light_capacity);
+		if (ImGui::Button("Add spot light")) {
+			spot_lights.push_back(SpotLight{});
+		}
+		ImGui::EndDisabled();
+
+		for (size_t i = 0; i < spot_lights.size();) {
+			ImGui::PushID(int(1000 + i));
+			bool remove = false;
+			if (ImGui::TreeNodeEx("light", ImGuiTreeNodeFlags_DefaultOpen, "Spot light %zu", i)) {
+				ImGui::DragFloat3("Position", &spot_lights[i].position.x, 0.05f);
+				ImGui::DragFloat3("Direction", &spot_lights[i].direction.x, 0.02f);
+				ImGui::ColorEdit3("Color", &spot_lights[i].color.x);
+				ImGui::SliderFloat("Intensity", &spot_lights[i].intensity, 0.0f, 200.0f);
+				ImGui::SliderFloat("Inner angle", &spot_lights[i].inner_angle, 1.0f, 80.0f);
+				ImGui::SliderFloat("Outer angle", &spot_lights[i].outer_angle, 1.0f, 80.0f);
+				// Яркая середина не должна быть шире конуса затухания
+				spot_lights[i].inner_angle = glm::min(spot_lights[i].inner_angle,
+				                                      spot_lights[i].outer_angle);
+				remove = ImGui::Button("Remove");
+				ImGui::TreePop();
+			}
+			ImGui::PopID();
+
+			if (remove) {
+				spot_lights.erase(spot_lights.begin() + long(i));
+			} else {
+				++i;
+			}
+		}
 	}
 
 	ImGui::End();
+}
+
+// ---------------------------------------------------------------------------
+// Загрузка данных кадра
+
+void uploadSceneData(float aspect) {
+	const glm::mat4 view_projection = projectionMatrix(camera, aspect) * viewMatrix(camera);
+
+	const SceneUniforms uniforms = {
+		.view_projection = view_projection,
+		.camera_position = glm::vec4(camera.position, 1.0f),
+		.ambient = glm::vec4(ambient_color, ambient_intensity),
+		.sun_direction = glm::vec4(sun.direction, 0.0f),
+		.sun_color = glm::vec4(sun.color, sun.intensity),
+		.light_counts = glm::uvec4(uint32_t(point_lights.size()),
+		                           uint32_t(spot_lights.size()), 0, 0),
+	};
+	graphics::uploadBuffer(scene_uniform_buffer, &uniforms, sizeof(uniforms));
+
+	if (!point_lights.empty()) {
+		std::vector<PointLightGPU> packed(point_lights.size());
+		for (size_t i = 0; i < point_lights.size(); ++i) {
+			packed[i].position = glm::vec4(point_lights[i].position, 1.0f);
+			packed[i].color = glm::vec4(point_lights[i].color, point_lights[i].intensity);
+		}
+		graphics::uploadBuffer(point_light_buffer, packed.data(),
+		                       sizeof(PointLightGPU) * packed.size());
+	}
+
+	if (!spot_lights.empty()) {
+		std::vector<SpotLightGPU> packed(spot_lights.size());
+		for (size_t i = 0; i < spot_lights.size(); ++i) {
+			const SpotLight& light = spot_lights[i];
+			// Косинусы считаются на CPU: шейдер сравнивает их напрямую,
+			// не вызывая acos для каждого фрагмента
+			packed[i].position = glm::vec4(light.position, std::cos(glm::radians(light.inner_angle)));
+			packed[i].direction = glm::vec4(glm::normalize(light.direction),
+			                                std::cos(glm::radians(light.outer_angle)));
+			packed[i].color = glm::vec4(light.color, light.intensity);
+		}
+		graphics::uploadBuffer(spot_light_buffer, packed.data(),
+		                       sizeof(SpotLightGPU) * packed.size());
+	}
+}
+
+void uploadModelData(Model& model, const glm::mat4& transform, const Material& material) {
+	const ModelUniforms uniforms = {
+		.model = transform,
+		.normal_matrix = normalMatrix(transform),
+		.albedo = glm::vec4(material.albedo, 1.0f),
+		.specular = glm::vec4(material.specular, material.shininess),
+	};
+	graphics::uploadBuffer(model.uniform_buffer, &uniforms, sizeof(uniforms));
+}
+
+void drawModel(VkCommandBuffer cmd, const Model& model) {
+	const VkDeviceSize offset = 0;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &model.mesh.vertex_buffer.buffer, &offset);
+	vkCmdBindIndexBuffer(cmd, model.mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+	// set 0 держится весь кадр, от объекта к объекту меняется только set 1
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+	                        1, 1, &model.descriptor_set, 0, nullptr);
+	vkCmdDrawIndexed(cmd, model.mesh.index_count, 1, 0, 0, 0);
 }
 
 } // namespace
@@ -434,19 +629,18 @@ void drawUI() {
 bool initialize() {
 	std::vector<Vertex> vertices;
 	std::vector<uint32_t> indices;
+
 	buildCylinder(vertices, indices, cylinder_segments, cylinder_radius, cylinder_height);
-
-	if (!graphics::createMesh(cylinder_mesh, vertices, indices)) {
+	if (!graphics::createMesh(cylinder.mesh, vertices, indices)) {
 		return false;
 	}
 
-	if (!createDescriptorLayouts() || !createDescriptors() || !createPipeline()) {
+	buildFloor(vertices, indices, floor_half_size);
+	if (!graphics::createMesh(floor_plane.mesh, vertices, indices)) {
 		return false;
 	}
 
-	transform.rotation = glm::vec3(20.0f, 0.0f, 15.0f);
-
-	return true;
+	return createDescriptorLayouts() && createDescriptors() && createPipeline();
 }
 
 void shutdown() {
@@ -456,14 +650,19 @@ void shutdown() {
 	vkDestroyPipeline(context.device, pipeline, nullptr);
 	vkDestroyPipelineLayout(context.device, pipeline_layout, nullptr);
 
-	graphics::destroyBuffer(model_uniform_buffer);
+	for (Model* model : { &cylinder, &floor_plane }) {
+		graphics::destroyBuffer(model->uniform_buffer);
+		graphics::destroyMesh(model->mesh);
+	}
+
+	graphics::destroyBuffer(spot_light_buffer);
+	graphics::destroyBuffer(point_light_buffer);
 	graphics::destroyBuffer(scene_uniform_buffer);
+
 	// Наборы дескрипторов освобождаются вместе с пулом
 	vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
-
-	graphics::destroyMesh(cylinder_mesh);
 }
 
 void update(double time) {
@@ -471,11 +670,6 @@ void update(double time) {
 	last_time = time;
 
 	updateCamera(dt);
-
-	if (animation.enabled && animation.playing) {
-		animation.time += dt * animation.speed;
-	}
-
 	drawUI();
 }
 
@@ -487,19 +681,12 @@ void render(const graphics::internal::FrameData& fd) {
 	auto& context = graphics::internal::context;
 	const VkExtent2D extent = context.swapchain_extent;
 
-	// Предыдущий кадр уже дорисован (prepare дождался fence),
-	// поэтому uniform-буфер можно спокойно перезаписать
-	const float aspect = float(extent.width) / float(extent.height);
-	const SceneUniforms scene_uniforms = {
-		.view_projection = projectionMatrix(camera, aspect) * viewMatrix(camera),
-	};
-	graphics::uploadBuffer(scene_uniform_buffer, &scene_uniforms, sizeof(scene_uniforms));
-
-	const ModelUniforms model_uniforms = {
-		.model = modelMatrix(transform, animation),
-		.color = color,
-	};
-	graphics::uploadBuffer(model_uniform_buffer, &model_uniforms, sizeof(model_uniforms));
+	// prepare дождался fence, значит GPU с этими буферами уже закончил
+	uploadSceneData(float(extent.width) / float(extent.height));
+	uploadModelData(cylinder, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, cylinder_level, 0.0f)),
+	                cylinder_material);
+	uploadModelData(floor_plane, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, floor_level, 0.0f)),
+	                floor_material);
 
 	VkCommandBuffer cmd = fd.command_buffer;
 
@@ -512,7 +699,7 @@ void render(const graphics::internal::FrameData& fd) {
 	vkBeginCommandBuffer(cmd, &begin);
 
 	const VkClearValue clear_values[] = {
-		{ .color = { { 0.08f, 0.09f, 0.12f, 1.0f } } },
+		{ .color = { { 0.03f, 0.03f, 0.05f, 1.0f } } },
 		{ .depthStencil = { 1.0f, 0 } },
 	};
 
@@ -541,16 +728,12 @@ void render(const graphics::internal::FrameData& fd) {
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-	const VkDeviceSize vertex_offset = 0;
-	vkCmdBindVertexBuffers(cmd, 0, 1, &cylinder_mesh.vertex_buffer.buffer, &vertex_offset);
-	vkCmdBindIndexBuffer(cmd, cylinder_mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-
 	// Данные сцены одинаковы для всех объектов, поэтому привязываются раз в кадр
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
 	                        0, 1, &scene_descriptor_set, 0, nullptr);
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-	                        1, 1, &model_descriptor_set, 0, nullptr);
-	vkCmdDrawIndexed(cmd, cylinder_mesh.index_count, 1, 0, 0, 0);
+
+	drawModel(cmd, floor_plane);
+	drawModel(cmd, cylinder);
 
 	vkCmdEndRenderPass(cmd);
 	vkEndCommandBuffer(cmd);
