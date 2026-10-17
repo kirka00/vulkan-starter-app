@@ -25,10 +25,14 @@ struct Vertex {
 	glm::vec3 normal;
 };
 
-struct alignas(16) ObjectUniforms {
+// set 0: данные сцены, привязываются один раз за кадр
+struct alignas(16) SceneUniforms {
+	glm::mat4 view_projection;
+};
+
+// set 1: данные объекта, перепривязываются перед каждой отрисовкой
+struct alignas(16) ModelUniforms {
 	glm::mat4 model;
-	glm::mat4 view;
-	glm::mat4 projection;
 	glm::vec4 color;
 };
 
@@ -74,10 +78,15 @@ constexpr float cylinder_height = 2.0f;
 
 graphics::Mesh cylinder_mesh;
 
-VkDescriptorSetLayout descriptor_set_layout;
+VkDescriptorSetLayout scene_set_layout;
+VkDescriptorSetLayout model_set_layout;
 VkDescriptorPool descriptor_pool;
-VkDescriptorSet descriptor_set;
-graphics::Buffer uniform_buffer;
+
+VkDescriptorSet scene_descriptor_set;
+graphics::Buffer scene_uniform_buffer;
+
+VkDescriptorSet model_descriptor_set;
+graphics::Buffer model_uniform_buffer;
 
 VkPipelineLayout pipeline_layout;
 VkPipeline pipeline;
@@ -192,9 +201,10 @@ glm::mat4 projectionMatrix(const Camera& c, float aspect) {
 // ---------------------------------------------------------------------------
 // Объекты Vulkan
 
-bool createDescriptors() {
+bool createDescriptorLayouts() {
 	auto& context = graphics::internal::context;
 
+	// Пока в обоих наборах по одному uniform-буферу
 	const VkDescriptorSetLayoutBinding binding = {
 		.binding = 0,
 		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -209,55 +219,36 @@ bool createDescriptors() {
 	};
 
 	if (vkCreateDescriptorSetLayout(context.device, &layout, nullptr,
-	                                &descriptor_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create descriptor set layout\n";
+	                                &scene_set_layout) != VK_SUCCESS ||
+	    vkCreateDescriptorSetLayout(context.device, &layout, nullptr,
+	                                &model_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create a descriptor set layout\n";
 		return false;
 	}
 
-	const VkDescriptorPoolSize pool_size = {
-		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
-	};
+	return true;
+}
 
-	const VkDescriptorPoolCreateInfo pool = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 1,
-		.poolSizeCount = 1,
-		.pPoolSizes = &pool_size,
-	};
-
-	if (vkCreateDescriptorPool(context.device, &pool, nullptr, &descriptor_pool) != VK_SUCCESS) {
-		std::cerr << "Failed to create descriptor pool\n";
-		return false;
-	}
-
-	if (!graphics::createBuffer(uniform_buffer, sizeof(ObjectUniforms),
-	                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
-		return false;
-	}
-
+bool allocateSet(VkDescriptorSetLayout layout, VkDescriptorSet& out) {
 	const VkDescriptorSetAllocateInfo allocate = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
 		.descriptorPool = descriptor_pool,
 		.descriptorSetCount = 1,
-		.pSetLayouts = &descriptor_set_layout,
+		.pSetLayouts = &layout,
 	};
+	return vkAllocateDescriptorSets(graphics::internal::context.device, &allocate, &out) == VK_SUCCESS;
+}
 
-	if (vkAllocateDescriptorSets(context.device, &allocate, &descriptor_set) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate descriptor set\n";
-		return false;
-	}
-
-	// Связываем запись 0 набора с uniform-буфером
+void writeBufferDescriptor(VkDescriptorSet set, const graphics::Buffer& buffer) {
 	const VkDescriptorBufferInfo buffer_info = {
-		.buffer = uniform_buffer.buffer,
+		.buffer = buffer.buffer,
 		.offset = 0,
-		.range = sizeof(ObjectUniforms),
+		.range = buffer.size,
 	};
 
 	const VkWriteDescriptorSet write = {
 		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.dstSet = descriptor_set,
+		.dstSet = set,
 		.dstBinding = 0,
 		.dstArrayElement = 0,
 		.descriptorCount = 1,
@@ -265,7 +256,45 @@ bool createDescriptors() {
 		.pBufferInfo = &buffer_info,
 	};
 
-	vkUpdateDescriptorSets(context.device, 1, &write, 0, nullptr);
+	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
+
+bool createDescriptors() {
+	auto& context = graphics::internal::context;
+
+	// По одному uniform-буферу на набор, наборов два
+	const VkDescriptorPoolSize pool_size = {
+		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 2,
+	};
+
+	const VkDescriptorPoolCreateInfo pool = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.maxSets = 2,
+		.poolSizeCount = 1,
+		.pPoolSizes = &pool_size,
+	};
+
+	if (vkCreateDescriptorPool(context.device, &pool, nullptr, &descriptor_pool) != VK_SUCCESS) {
+		std::cerr << "Failed to create the descriptor pool\n";
+		return false;
+	}
+
+	if (!graphics::createBuffer(scene_uniform_buffer, sizeof(SceneUniforms),
+	                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+	    !graphics::createBuffer(model_uniform_buffer, sizeof(ModelUniforms),
+	                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+		return false;
+	}
+
+	if (!allocateSet(scene_set_layout, scene_descriptor_set) ||
+	    !allocateSet(model_set_layout, model_descriptor_set)) {
+		std::cerr << "Failed to allocate a descriptor set\n";
+		return false;
+	}
+
+	writeBufferDescriptor(scene_descriptor_set, scene_uniform_buffer);
+	writeBufferDescriptor(model_descriptor_set, model_uniform_buffer);
 
 	return true;
 }
@@ -273,10 +302,13 @@ bool createDescriptors() {
 bool createPipeline() {
 	auto& context = graphics::internal::context;
 
+	// Layout перечисляет оба набора в том порядке, в котором их ждёт шейдер
+	const VkDescriptorSetLayout set_layouts[] = { scene_set_layout, model_set_layout };
+
 	const VkPipelineLayoutCreateInfo layout = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 1,
-		.pSetLayouts = &descriptor_set_layout,
+		.setLayoutCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
+		.pSetLayouts = set_layouts,
 	};
 
 	if (vkCreatePipelineLayout(context.device, &layout, nullptr, &pipeline_layout) != VK_SUCCESS) {
@@ -388,7 +420,7 @@ bool initialize() {
 		return false;
 	}
 
-	if (!createDescriptors() || !createPipeline()) {
+	if (!createDescriptorLayouts() || !createDescriptors() || !createPipeline()) {
 		return false;
 	}
 
@@ -404,10 +436,12 @@ void shutdown() {
 	vkDestroyPipeline(context.device, pipeline, nullptr);
 	vkDestroyPipelineLayout(context.device, pipeline_layout, nullptr);
 
-	graphics::destroyBuffer(uniform_buffer);
-	// Набор дескрипторов освобождается вместе с пулом
+	graphics::destroyBuffer(model_uniform_buffer);
+	graphics::destroyBuffer(scene_uniform_buffer);
+	// Наборы дескрипторов освобождаются вместе с пулом
 	vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
-	vkDestroyDescriptorSetLayout(context.device, descriptor_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
 
 	graphics::destroyMesh(cylinder_mesh);
 }
@@ -434,13 +468,16 @@ void render(const graphics::internal::FrameData& fd) {
 	// Предыдущий кадр уже дорисован (prepare дождался fence),
 	// поэтому uniform-буфер можно спокойно перезаписать
 	const float aspect = float(extent.width) / float(extent.height);
-	const ObjectUniforms uniforms = {
+	const SceneUniforms scene_uniforms = {
+		.view_projection = projectionMatrix(camera, aspect) * viewMatrix(camera),
+	};
+	graphics::uploadBuffer(scene_uniform_buffer, &scene_uniforms, sizeof(scene_uniforms));
+
+	const ModelUniforms model_uniforms = {
 		.model = modelMatrix(transform, animation),
-		.view = viewMatrix(camera),
-		.projection = projectionMatrix(camera, aspect),
 		.color = color,
 	};
-	graphics::uploadBuffer(uniform_buffer, &uniforms, sizeof(uniforms));
+	graphics::uploadBuffer(model_uniform_buffer, &model_uniforms, sizeof(model_uniforms));
 
 	VkCommandBuffer cmd = fd.command_buffer;
 
@@ -486,8 +523,11 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdBindVertexBuffers(cmd, 0, 1, &cylinder_mesh.vertex_buffer.buffer, &vertex_offset);
 	vkCmdBindIndexBuffer(cmd, cylinder_mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
+	// Данные сцены одинаковы для всех объектов, поэтому привязываются раз в кадр
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-	                        0, 1, &descriptor_set, 0, nullptr);
+	                        0, 1, &scene_descriptor_set, 0, nullptr);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+	                        1, 1, &model_descriptor_set, 0, nullptr);
 	vkCmdDrawIndexed(cmd, cylinder_mesh.index_count, 1, 0, 0, 0);
 
 	vkCmdEndRenderPass(cmd);
