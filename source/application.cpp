@@ -22,7 +22,7 @@ namespace {
 
 struct Vertex {
 	glm::vec3 position;
-	glm::vec3 color;
+	glm::vec3 normal;
 };
 
 struct alignas(16) ObjectUniforms {
@@ -92,46 +92,48 @@ double last_time = 0.0;
 // ---------------------------------------------------------------------------
 // Геометрия
 
-glm::vec3 proceduralColor(const glm::vec3& p) {
-	return glm::vec3(
-		p.x / cylinder_radius * 0.5f + 0.5f,
-		p.y / (cylinder_height * 0.5f) * 0.5f + 0.5f,
-		p.z / cylinder_radius * 0.5f + 0.5f
-	);
-}
-
 void buildCylinder(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
                    uint32_t segments, float radius, float height) {
 	const float half = height * 0.5f;
 
-	// [0, segments) — верхнее кольцо, [segments, 2 * segments) — нижнее
+	// [0, N) — верх стенки, [N, 2N) — низ стенки
 	for (uint32_t i = 0; i < segments; ++i) {
 		const float angle = glm::two_pi<float>() * float(i) / float(segments);
-		const glm::vec3 top(radius * std::cos(angle), half, radius * std::sin(angle));
-		vertices.push_back({ top, proceduralColor(top) });
+		const glm::vec3 normal(std::cos(angle), 0.0f, std::sin(angle));
+		vertices.push_back({ glm::vec3(radius * normal.x, half, radius * normal.z), normal });
 	}
 	for (uint32_t i = 0; i < segments; ++i) {
-		const glm::vec3 bottom = vertices[i].position - glm::vec3(0.0f, height, 0.0f);
-		vertices.push_back({ bottom, proceduralColor(bottom) });
+		const glm::vec3 normal = vertices[i].normal;
+		vertices.push_back({ glm::vec3(radius * normal.x, -half, radius * normal.z), normal });
 	}
 
+	// [2N, 3N) — кольцо верхней крышки, затем её центр
+	const uint32_t top_ring = uint32_t(vertices.size());
+	for (uint32_t i = 0; i < segments; ++i) {
+		vertices.push_back({ glm::vec3(vertices[i].position.x, half, vertices[i].position.z),
+		                     glm::vec3(0.0f, 1.0f, 0.0f) });
+	}
 	const uint32_t top_center = uint32_t(vertices.size());
-	vertices.push_back({ glm::vec3(0.0f, half, 0.0f), proceduralColor(glm::vec3(0.0f, half, 0.0f)) });
-	const uint32_t bottom_center = uint32_t(vertices.size());
-	vertices.push_back({ glm::vec3(0.0f, -half, 0.0f), proceduralColor(glm::vec3(0.0f, -half, 0.0f)) });
+	vertices.push_back({ glm::vec3(0.0f, half, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f) });
 
+	// Кольцо нижней крышки, затем её центр
+	const uint32_t bottom_ring = uint32_t(vertices.size());
+	for (uint32_t i = 0; i < segments; ++i) {
+		vertices.push_back({ glm::vec3(vertices[i].position.x, -half, vertices[i].position.z),
+		                     glm::vec3(0.0f, -1.0f, 0.0f) });
+	}
+	const uint32_t bottom_center = uint32_t(vertices.size());
+	vertices.push_back({ glm::vec3(0.0f, -half, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f) });
+
+	// Все треугольники обходятся против часовой стрелки при взгляде снаружи
 	for (uint32_t i = 0; i < segments; ++i) {
 		const uint32_t j = (i + 1) % segments;
-		const uint32_t top_i = i, top_j = j;
-		const uint32_t bottom_i = segments + i, bottom_j = segments + j;
 
-		// Боковая стенка: два треугольника на сегмент
-		indices.insert(indices.end(), { bottom_i, top_i, bottom_j });
-		indices.insert(indices.end(), { bottom_j, top_i, top_j });
+		indices.insert(indices.end(), { segments + i, i, segments + j });
+		indices.insert(indices.end(), { segments + j, i, j });
 
-		// Крышки: треугольные веера вокруг центров
-		indices.insert(indices.end(), { top_center, top_j, top_i });
-		indices.insert(indices.end(), { bottom_center, bottom_i, bottom_j });
+		indices.insert(indices.end(), { top_center, top_ring + j, top_ring + i });
+		indices.insert(indices.end(), { bottom_center, bottom_ring + i, bottom_ring + j });
 	}
 }
 
@@ -303,7 +305,7 @@ bool createPipeline() {
 				.location = 1,
 				.binding = 0,
 				.format = VK_FORMAT_R32G32B32_SFLOAT,
-				.offset = offsetof(Vertex, color),
+				.offset = offsetof(Vertex, normal),
 			},
 		},
 		.layout = pipeline_layout,
