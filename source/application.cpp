@@ -57,16 +57,14 @@ struct Animation {
 };
 
 struct Camera {
-	bool perspective = true;
-	float fov = 60.0f;          // Градусы, только для перспективы
-	float ortho_height = 10.0f; // Видимая высота в мировых единицах, только для ортографии
+	glm::vec3 position = glm::vec3(0.0f, 1.2f, 7.0f);
+	float yaw = 0.0f;    // Градусы, поворот вокруг Y; при 0 взгляд вдоль -Z
+	float pitch = -6.0f; // Градусы
+	float fov = 60.0f;
 
-	// Точка наблюдения фиксированная: подвижная камера не входит в эту работу
+	static constexpr float move_speed = 5.0f;
 	static constexpr float near_plane = 0.1f;
 	static constexpr float far_plane = 100.0f;
-	static constexpr float distance = 9.0f;
-	static constexpr float yaw = 30.0f;   // Градусы
-	static constexpr float pitch = 20.0f; // Градусы
 };
 
 constexpr uint32_t cylinder_segments = 50;
@@ -173,29 +171,58 @@ glm::mat4 modelMatrix(const Transform& t, const Animation& a) {
 	       glm::scale(glm::mat4(1.0f), t.scale);
 }
 
-glm::mat4 viewMatrix(const Camera& c) {
+glm::vec3 cameraForward(const Camera& c) {
 	const float yaw = glm::radians(c.yaw);
 	const float pitch = glm::radians(c.pitch);
-	const glm::vec3 eye = c.distance * glm::vec3(
+	return glm::normalize(glm::vec3(
 		std::cos(pitch) * std::sin(yaw),
 		std::sin(pitch),
-		std::cos(pitch) * std::cos(yaw)
-	);
-	return glm::lookAt(eye, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+		-std::cos(pitch) * std::cos(yaw)
+	));
+}
+
+glm::mat4 viewMatrix(const Camera& c) {
+	return glm::lookAt(c.position, c.position + cameraForward(c), glm::vec3(0.0f, 1.0f, 0.0f));
 }
 
 glm::mat4 projectionMatrix(const Camera& c, float aspect) {
-	glm::mat4 projection;
-	if (c.perspective) {
-		projection = glm::perspective(glm::radians(c.fov), aspect, c.near_plane, c.far_plane);
-	} else {
-		const float half_h = c.ortho_height * 0.5f;
-		const float half_w = half_h * aspect;
-		projection = glm::ortho(-half_w, half_w, -half_h, half_h, c.near_plane, c.far_plane);
-	}
+	glm::mat4 projection = glm::perspective(glm::radians(c.fov), aspect,
+	                                        c.near_plane, c.far_plane);
 	// GLM рассчитан на OpenGL (Y в клип-пространстве вверх), в Vulkan — вниз
 	projection[1][1] *= -1.0f;
 	return projection;
+}
+
+// ---------------------------------------------------------------------------
+// Управление камерой
+
+void updateCamera(float dt) {
+	ImGuiIO& io = ImGui::GetIO();
+
+	if (!io.WantCaptureMouse && ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+		constexpr float sensitivity = 0.15f;
+		camera.yaw += io.MouseDelta.x * sensitivity;
+		camera.pitch = glm::clamp(camera.pitch - io.MouseDelta.y * sensitivity, -89.0f, 89.0f);
+	}
+
+	if (io.WantCaptureKeyboard) {
+		return;
+	}
+
+	const glm::vec3 forward = cameraForward(camera);
+	const glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
+
+	glm::vec3 motion(0.0f);
+	if (ImGui::IsKeyDown(ImGuiKey_W)) { motion += forward; }
+	if (ImGui::IsKeyDown(ImGuiKey_S)) { motion -= forward; }
+	if (ImGui::IsKeyDown(ImGuiKey_D)) { motion += right; }
+	if (ImGui::IsKeyDown(ImGuiKey_A)) { motion -= right; }
+	if (ImGui::IsKeyDown(ImGuiKey_E)) { motion += glm::vec3(0.0f, 1.0f, 0.0f); }
+	if (ImGui::IsKeyDown(ImGuiKey_Q)) { motion -= glm::vec3(0.0f, 1.0f, 0.0f); }
+
+	if (glm::dot(motion, motion) > 0.0f) {
+		camera.position += glm::normalize(motion) * Camera::move_speed * dt;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -360,18 +387,11 @@ void drawUI() {
 	            double(ImGui::GetIO().Framerate), cylinder_mesh.vertex_count,
 	            cylinder_mesh.index_count / 3);
 
-	if (ImGui::CollapsingHeader("Projection", ImGuiTreeNodeFlags_DefaultOpen)) {
-		int mode = camera.perspective ? 0 : 1;
-		ImGui::RadioButton("Perspective", &mode, 0);
-		ImGui::SameLine();
-		ImGui::RadioButton("Orthographic", &mode, 1);
-		camera.perspective = (mode == 0);
-
-		if (camera.perspective) {
-			ImGui::SliderFloat("FOV (deg)", &camera.fov, 10.0f, 150.0f);
-		} else {
-			ImGui::SliderFloat("View height", &camera.ortho_height, 1.0f, 30.0f);
-		}
+	if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::DragFloat3("Position", &camera.position.x, 0.05f);
+		ImGui::SliderFloat("Yaw (deg)", &camera.yaw, -180.0f, 180.0f);
+		ImGui::SliderFloat("Pitch (deg)", &camera.pitch, -89.0f, 89.0f);
+		ImGui::SliderFloat("FOV (deg)", &camera.fov, 20.0f, 120.0f);
 	}
 
 	if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -449,6 +469,8 @@ void shutdown() {
 void update(double time) {
 	const float dt = last_time > 0.0 ? float(time - last_time) : 0.0f;
 	last_time = time;
+
+	updateCamera(dt);
 
 	if (animation.enabled && animation.playing) {
 		animation.time += dt * animation.speed;
