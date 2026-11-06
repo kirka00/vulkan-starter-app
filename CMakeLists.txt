@@ -8,6 +8,7 @@ add_executable(${PROJECT_NAME}
 	source/graphics_internal.cpp
 	source/graphics.cpp
 	source/application.cpp
+	source/stb_image.cpp
 )
 
 if(LINUX)
@@ -59,6 +60,13 @@ FetchContent_Declare(
 	GIT_TAG 1.0.1
 )
 
+# Однофайловый декодер изображений, у репозитория нет тегов, поэтому фиксируем коммит
+FetchContent_Declare(
+	stb
+	GIT_REPOSITORY https://github.com/nothings/stb.git
+	GIT_TAG 003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5
+)
+
 find_package(Vulkan REQUIRED)
 
 set(GLFW_LIBRARY_TYPE STATIC)
@@ -72,6 +80,7 @@ FetchContent_MakeAvailable(
 	VulkanMemoryAllocator
 	imgui
 	glm
+	stb
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -82,7 +91,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 	glm::glm
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends ${stb_SOURCE_DIR})
 target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
 	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
@@ -119,8 +128,8 @@ if(GLSLC_FOUND)
 	# compile_shader(example.vert)
 	# compile_shader(example.frag)
 
-	compile_shader(cylinder.vert)
-	compile_shader(cylinder.frag)
+	compile_shader(scene.vert)
+	compile_shader(scene.frag)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)
