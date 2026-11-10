@@ -197,9 +197,6 @@ bool uploadToBuffer(Uploader& up, const Buffer& dst, const void* data, VkDeviceS
 bool uploadToTexture(Uploader& up, Texture& out, const void* pixels,
                      uint32_t width, uint32_t height, VkFormat format) {
 	auto& context = internal::context;
-
-	// Мип-уровни строятся на GPU через vkCmdBlitImage с линейной фильтрацией,
-	// формат должен это поддерживать, иначе обходимся одним уровнем
 	VkFormatProperties format_props = {};
 	vkGetPhysicalDeviceFormatProperties(context.physical_device, format, &format_props);
 	const bool can_blit = format_props.optimalTilingFeatures &
