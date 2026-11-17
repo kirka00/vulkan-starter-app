@@ -1,3 +1,8 @@
+// VkPhysicalDevicePortabilitySubsetFeaturesKHR объявлена в vulkan_beta.h
+#ifdef __APPLE__
+#define VK_ENABLE_BETA_EXTENSIONS
+#endif
+
 #include "graphics_internal.hpp"
 
 #include <iostream>
@@ -76,6 +81,9 @@ VkFormat selectDepthFormat(VkPhysicalDevice physical_device) {
 	return VK_FORMAT_UNDEFINED;
 }
 
+// Место под картинки приложения в окне ImGui
+constexpr uint32_t imgui_user_textures = 4;
+
 bool initializeImGUI() {
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
 		{
@@ -84,14 +92,14 @@ bool initializeImGUI() {
 		},
 		{
 			.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-			.descriptorCount = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE,
+			.descriptorCount = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE + imgui_user_textures,
 		},
 	};
 
 	const VkDescriptorPoolCreateInfo descriptor_pool = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
 		.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-		.maxSets = uint32_t(vk_swapchain_images.size()),
+		.maxSets = uint32_t(vk_swapchain_images.size()) + imgui_user_textures,
 		.poolSizeCount = sizeof(descriptor_pool_sizes) / sizeof(descriptor_pool_sizes[0]),
 		.pPoolSizes = descriptor_pool_sizes,
 	};
@@ -389,7 +397,8 @@ Context context;
 bool initialize(GLFWwindow* const window) {
 	vkb::InstanceBuilder ib;
 
-	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 1, 0))
+	// Динамический рендеринг вошёл в ядро Vulkan 1.3
+	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 3, 0))
 				 .request_validation_layers()
 				 .build();
 
@@ -406,7 +415,24 @@ bool initialize(GLFWwindow* const window) {
 
 	vkb::PhysicalDeviceSelector pds(vkb_instance, vk_surface);
 
+	VkPhysicalDeviceVulkan13Features features_13 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+		.dynamicRendering = VK_TRUE,
+	};
+
+#ifdef __APPLE__
+	// MoltenVK включает сэмплеры сравнения и перестановку каналов только по запросу
+	VkPhysicalDevicePortabilitySubsetFeaturesKHR portability = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR,
+		.imageViewFormatSwizzle = VK_TRUE,
+		.mutableComparisonSamplers = VK_TRUE,
+	};
+	pds.add_required_extension_features(portability);
+#endif
+
 	auto pds_result = pds.prefer_gpu_device_type(vkb::PreferredDeviceType::discrete)
+						 .set_minimum_version(1, 3)
+						 .set_required_features_13(features_13)
 						 .require_present()
 						 .select();
 	if (!pds_result) {

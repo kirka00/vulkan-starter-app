@@ -89,13 +89,15 @@ VkShaderModule loadShaderModule(const std::string& path);
 
 struct GraphicsPipelineDesc {
 	std::string vertex_shader_path;
-	std::string fragment_shader_path;
+	std::string fragment_shader_path; // Пустая строка — без фрагментного шейдера
 
 	std::vector<VkVertexInputBindingDescription> vertex_bindings;
 	std::vector<VkVertexInputAttributeDescription> vertex_attributes;
 
 	VkPipelineLayout layout = VK_NULL_HANDLE;
+	// render_pass = VK_NULL_HANDLE — динамический рендеринг с вложением глубины depth_format
 	VkRenderPass render_pass = VK_NULL_HANDLE;
+	VkFormat depth_format = VK_FORMAT_UNDEFINED;
 
 	VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 	VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
@@ -104,6 +106,7 @@ struct GraphicsPipelineDesc {
 
 	bool depth_test = true;
 	bool depth_write = true;
+	bool depth_bias = false;
 };
 
 VkPipeline createGraphicsPipeline(const GraphicsPipelineDesc& desc);

@@ -411,9 +411,13 @@ VkShaderModule loadShaderModule(const std::string& path) {
 VkPipeline createGraphicsPipeline(const GraphicsPipelineDesc& desc) {
 	auto& context = internal::context;
 
+	const bool has_fragment = !desc.fragment_shader_path.empty();
+	const bool dynamic_rendering = desc.render_pass == VK_NULL_HANDLE;
+
 	VkShaderModule vertex_shader = loadShaderModule(desc.vertex_shader_path);
-	VkShaderModule fragment_shader = loadShaderModule(desc.fragment_shader_path);
-	if (vertex_shader == VK_NULL_HANDLE || fragment_shader == VK_NULL_HANDLE) {
+	VkShaderModule fragment_shader = has_fragment ? loadShaderModule(desc.fragment_shader_path)
+	                                              : VK_NULL_HANDLE;
+	if (vertex_shader == VK_NULL_HANDLE || (has_fragment && fragment_shader == VK_NULL_HANDLE)) {
 		vkDestroyShaderModule(context.device, vertex_shader, nullptr);
 		vkDestroyShaderModule(context.device, fragment_shader, nullptr);
 		return VK_NULL_HANDLE;
@@ -459,6 +463,7 @@ VkPipeline createGraphicsPipeline(const GraphicsPipelineDesc& desc) {
 		.polygonMode = desc.polygon_mode,
 		.cullMode = desc.cull_mode,
 		.frontFace = desc.front_face,
+		.depthBiasEnable = desc.depth_bias,
 		.lineWidth = 1.0f,
 	};
 
@@ -481,24 +486,32 @@ VkPipeline createGraphicsPipeline(const GraphicsPipelineDesc& desc) {
 
 	const VkPipelineColorBlendStateCreateInfo color_blend = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-		.attachmentCount = 1,
+		.attachmentCount = dynamic_rendering ? 0u : 1u,
 		.pAttachments = &color_blend_attachment,
 	};
 
 	const VkDynamicState dynamic_states[] = {
 		VK_DYNAMIC_STATE_VIEWPORT,
 		VK_DYNAMIC_STATE_SCISSOR,
+		VK_DYNAMIC_STATE_DEPTH_BIAS,
 	};
 
 	const VkPipelineDynamicStateCreateInfo dynamic_state = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-		.dynamicStateCount = sizeof(dynamic_states) / sizeof(dynamic_states[0]),
+		.dynamicStateCount = desc.depth_bias ? 3u : 2u,
 		.pDynamicStates = dynamic_states,
+	};
+
+	const VkPipelineRenderingCreateInfo rendering = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+		.colorAttachmentCount = 0,
+		.depthAttachmentFormat = desc.depth_format,
 	};
 
 	const VkGraphicsPipelineCreateInfo pipeline = {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-		.stageCount = sizeof(stages) / sizeof(stages[0]),
+		.pNext = dynamic_rendering ? &rendering : nullptr,
+		.stageCount = has_fragment ? 2u : 1u,
 		.pStages = stages,
 		.pVertexInputState = &vertex_input,
 		.pInputAssemblyState = &input_assembly,
@@ -522,7 +535,9 @@ VkPipeline createGraphicsPipeline(const GraphicsPipelineDesc& desc) {
 
 	// Модули уже встроены в конвейер, их можно сразу освободить
 	vkDestroyShaderModule(context.device, vertex_shader, nullptr);
-	vkDestroyShaderModule(context.device, fragment_shader, nullptr);
+	if (fragment_shader != VK_NULL_HANDLE) {
+		vkDestroyShaderModule(context.device, fragment_shader, nullptr);
+	}
 
 	return result;
 }

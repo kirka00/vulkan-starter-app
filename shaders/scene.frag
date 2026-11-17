@@ -3,6 +3,7 @@
 layout(location = 0) in vec3 in_world_position;
 layout(location = 1) in vec3 in_normal;
 layout(location = 2) in vec2 in_uv;
+layout(location = 3) in vec4 in_light_position;
 
 layout(location = 0) out vec4 out_color;
 
@@ -24,6 +25,8 @@ layout(set = 0, binding = 0) uniform SceneUniforms {
 	vec4 sun_direction;
 	vec4 sun_color;
 	uvec4 light_counts;
+	mat4 light_view_projection;
+	vec4 shadow_params;
 } scene;
 
 layout(std430, set = 0, binding = 1) readonly buffer PointLightBuffer {
@@ -33,6 +36,8 @@ layout(std430, set = 0, binding = 1) readonly buffer PointLightBuffer {
 layout(std430, set = 0, binding = 2) readonly buffer SpotLightBuffer {
 	SpotLight lights[];
 } spot_lights;
+
+layout(set = 0, binding = 3) uniform sampler2DShadow shadow_map;
 
 layout(set = 1, binding = 0) uniform ModelUniforms {
 	mat4 model;
@@ -63,6 +68,32 @@ vec3 sampleAnimated(sampler2D map, vec2 uv) {
 	vec3 a = texture(map, uv + wave + vec2(0.04 * t, 0.0)).rgb;
 	vec3 b = texture(map, uv * 1.7 - wave + vec2(-0.025 * t, 0.05 * t)).rgb;
 	return mix(a, b, 0.5);
+}
+
+float sunVisibility() {
+	if (scene.shadow_params.x == 0.0) {
+		return 1.0;
+	}
+
+	vec3 ndc = in_light_position.xyz / in_light_position.w;
+	if (ndc.z > 1.0) {
+		return 1.0;
+	}
+
+	vec2 uv = ndc.xy * 0.5 + 0.5;
+
+	if (scene.shadow_params.y == 0.0) {
+		return texture(shadow_map, vec3(uv, ndc.z));
+	}
+
+	float texel = scene.shadow_params.z;
+	float sum = 0.0;
+	for (int y = -1; y <= 1; ++y) {
+		for (int x = -1; x <= 1; ++x) {
+			sum += texture(shadow_map, vec3(uv + vec2(x, y) * texel, ndc.z));
+		}
+	}
+	return sum / 9.0;
 }
 
 vec3 blinnPhong(vec3 n, vec3 v, vec3 l, vec3 radiance, vec3 albedo, vec3 specular_color) {
@@ -99,7 +130,8 @@ void main() {
 
 	vec3 color = scene.ambient.rgb * scene.ambient.a * albedo;
 
-	color += blinnPhong(n, v, normalize(-scene.sun_direction.xyz),
+	color += sunVisibility() *
+	         blinnPhong(n, v, normalize(-scene.sun_direction.xyz),
 	                    scene.sun_color.rgb * scene.sun_color.a, albedo, specular_color);
 
 	for (uint i = 0; i < scene.light_counts.x; ++i) {

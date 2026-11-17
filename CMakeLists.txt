@@ -130,6 +130,7 @@ if(GLSLC_FOUND)
 
 	compile_shader(scene.vert)
 	compile_shader(scene.frag)
+	compile_shader(shadow.vert)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)
